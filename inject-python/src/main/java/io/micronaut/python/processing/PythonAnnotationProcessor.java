@@ -893,23 +893,28 @@ public class PythonAnnotationProcessor extends AbstractInjectAnnotationProcessor
                                 self._target = target
                                 self._interface = interface
 
+                            def _resolved(self):
+                                if isinstance(self._target, str):
+                                    self._target = java.type(self._target)
+                                return self._target
+
                             def __getattr__(self, name):
                                 if name.endswith('_') and keyword.iskeyword(name[:-1]):
                                     name = name[:-1]
-                                return getattr(self._target, name)
+                                return getattr(self._resolved(), name)
 
                             def __call__(self, *args, **kwargs):
-                                return self._target(*args, **kwargs)
+                                return self._resolved()(*args, **kwargs)
 
                             def __getitem__(self, item):
                                 if self._interface:
                                     return self
-                                return self._target[item]
+                                return self._resolved()[item]
 
                             def __mro_entries__(self, bases):
                                 if self._interface:
                                     return ()
-                                return (self._target,)
+                                return (self._resolved(),)
 
                         """);
                 }
@@ -932,9 +937,9 @@ public class PythonAnnotationProcessor extends AbstractInjectAnnotationProcessor
                     JavaClassImport javaClassImport = mapping.getValue();
                     if (javaClassImport.requiresFacade()) {
                         initContent.append(typeName)
-                            .append(" = _MicronautJavaType(java.type('")
+                            .append(" = _MicronautJavaType('")
                             .append(javaClassImport.className())
-                            .append("'), ")
+                            .append("', ")
                             .append(javaClassImport.interfaceType() ? "True" : "False")
                             .append(")\n");
                     } else {

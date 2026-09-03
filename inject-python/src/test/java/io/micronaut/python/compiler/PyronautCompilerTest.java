@@ -64,8 +64,10 @@ final class PyronautCompilerTest {
     @Test
     void compilesPythonMethodsReturningHttpResponseSubtypes(@TempDir Path sourceDirectory) throws Exception {
         Files.writeString(sourceDirectory.resolve("responses.py"), """
+            from jakarta.inject import Singleton
             from micronaut.http import MutableHttpResponse
 
+            @Singleton
             class Responses:
                 def response(self) -> MutableHttpResponse:
                     return None
@@ -77,6 +79,13 @@ final class PyronautCompilerTest {
             .buildClassLoader();
 
         assertNotNull(classLoader.loadClass("pyronaut_application.PyronautMain"));
+        assertNotNull(classLoader.loadClass("python.Responses"));
+        try (var input = classLoader.getResourceAsStream("META-INF/GRAALPY-VFS/micronaut-application/src/micronaut/http/__init__.py")) {
+            assertNotNull(input);
+            String generated = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+            assertTrue(generated.contains("_MicronautJavaType('io.micronaut.http.MutableHttpResponse'"));
+            assertTrue(generated.contains("self._target = java.type(self._target)"));
+        }
     }
 
     @Test
