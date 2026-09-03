@@ -322,7 +322,10 @@ public final class DefaultBeanDefinitionService implements BeanDefinitionService
 
     private List<BeanDefinitionProducer> resolveProducersForBeanType(Argument<?> beanType) {
         Class<?> type = beanType.getType();
-        Beans beansNotNull = Objects.requireNonNull(beans);
+        Beans beansNotNull = beans;
+        if (beansNotNull == null) {
+            return List.of();
+        }
         if (type == Object.class) {
             return beansNotNull.all;
         }

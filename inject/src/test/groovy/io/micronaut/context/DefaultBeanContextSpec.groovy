@@ -104,6 +104,17 @@ class DefaultBeanContextSpec extends Specification {
             e.message == "Cannot resolve beans until the context is running"
     }
 
+    def "getting bean definitions from a closed context is empty"() {
+        given:
+            ApplicationContext context = ApplicationContext.run()
+
+        when:
+            context.close()
+
+        then:
+            context.getBeanDefinitions(String).isEmpty()
+    }
+
     static class MyBean {
     }
 }
