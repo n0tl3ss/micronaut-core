@@ -47,6 +47,7 @@ import io.micronaut.inject.ast.TypedElement;
 import io.micronaut.inject.beans.AbstractEnumBeanIntrospectionAndReference;
 import io.micronaut.inject.beans.AbstractInitializableBeanIntrospection;
 import io.micronaut.inject.beans.AbstractInitializableBeanIntrospectionAndReference;
+import io.micronaut.inject.processing.ProcessingException;
 import io.micronaut.inject.visitor.VisitorContext;
 import io.micronaut.inject.writer.ArgumentExpUtils;
 import io.micronaut.inject.writer.DispatchWriter;
@@ -77,6 +78,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -94,6 +96,11 @@ import java.util.stream.IntStream;
 @Internal
 final class BeanIntrospectionWriter implements OriginatingElements, Buildable<List<OutputObjectDef>> {
     private static final String INTROSPECTION_SUFFIX = "$Introspection";
+    /**
+     * The longest name a generated introspection may have. The name is used as a single file name
+     * component, and file systems commonly cap those at 255 bytes.
+     */
+    private static final int MAX_INTROSPECTION_NAME_LENGTH = 240;
 
     private static final String FIELD_CONSTRUCTOR_ANNOTATION_METADATA = "$FIELD_CONSTRUCTOR_ANNOTATION_METADATA";
     private static final String FIELD_CONSTRUCTOR_ARGUMENTS = "$CONSTRUCTOR_ARGUMENTS";
@@ -134,6 +141,12 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
         AnnotationMetadata.class
     );
 
+    private static final java.lang.reflect.Constructor<?> ENUM_CONSTANT_OBJECT_REF_CONSTRUCTOR = ReflectionUtils.getRequiredInternalConstructor(
+        AbstractEnumBeanIntrospectionAndReference.EnumConstantObjectRef.class,
+        Object.class,
+        AnnotationMetadata.class
+    );
+
     private static final java.lang.reflect.Constructor<?> INTROSPECTION_SUPER_CONSTRUCTOR = ReflectionUtils.getRequiredInternalConstructor(
         AbstractInitializableBeanIntrospectionAndReference.class,
         Class.class,
@@ -171,6 +184,17 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
         AbstractInitializableBeanIntrospection.BeanPropertyRef[].class,
         AbstractInitializableBeanIntrospection.BeanMethodRef[].class,
         AbstractEnumBeanIntrospectionAndReference.EnumConstantDynamicRef[].class
+    );
+
+    private static final java.lang.reflect.Constructor<?> ENUM_INTROSPECTION_OBJECT_SUPER_CONSTRUCTOR = ReflectionUtils.getRequiredInternalConstructor(
+        AbstractEnumBeanIntrospectionAndReference.class,
+        Class.class,
+        AnnotationMetadata.class,
+        AnnotationMetadata.class,
+        Argument[].class,
+        AbstractInitializableBeanIntrospection.BeanPropertyRef[].class,
+        AbstractInitializableBeanIntrospection.BeanMethodRef[].class,
+        AbstractEnumBeanIntrospectionAndReference.EnumConstantObjectRef[].class
     );
 
     private static final java.lang.reflect.Constructor<?> BEAN_PROPERTY_REF_CONSTRUCTOR = ReflectionUtils.getRequiredInternalConstructor(
@@ -236,6 +260,7 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
     private final DispatchWriter dispatchWriter;
     private final EvaluatedExpressionProcessor evaluatedExpressionProcessor;
     private final AnnotationMetadata annotationMetadata;
+    private final Optional<MethodElement> enumValueOfMethod;
 
     private final OriginatingElements originatingElements;
 
@@ -261,6 +286,7 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
         this.originatingElements = OriginatingElements.of(beanClassElement);
         evaluatedExpressionProcessor = new EvaluatedExpressionProcessor(visitorContext, beanClassElement);
         evaluatedExpressionProcessor.processEvaluatedExpressions(annotationMetadata, null);
+        enumValueOfMethod = enumValueOfMethod(beanClassElement);
         this.visitorContext = visitorContext;
     }
 
@@ -292,6 +318,29 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
         this.originatingElements = OriginatingElements.of(originatingElement);
         evaluatedExpressionProcessor = new EvaluatedExpressionProcessor(visitorContext, beanClassElement);
         evaluatedExpressionProcessor.processEvaluatedExpressions(annotationMetadata, null);
+        enumValueOfMethod = enumValueOfMethod(beanClassElement);
+    }
+
+    private static Optional<MethodElement> enumValueOfMethod(ClassElement beanClassElement) {
+        if (beanClassElement instanceof EnumElement enumElement) {
+            return enumElement.getEnumValueOfMethod().map(method -> validateEnumValueOfMethod(beanClassElement, method));
+        }
+        return Optional.empty();
+    }
+
+    private static MethodElement validateEnumValueOfMethod(ClassElement beanClassElement, MethodElement method) {
+        ParameterElement[] parameters = method.getParameters();
+        boolean validParameter = parameters.length == 1 && (
+            String.class.getName().equals(parameters[0].getType().getName()) ||
+                CharSequence.class.getName().equals(parameters[0].getType().getName())
+        );
+        if (!method.isStatic() || method.isPrivate() || !validParameter || !method.getReturnType().isAssignable(beanClassElement)) {
+            throw new ProcessingException(beanClassElement,
+                "The enum value lookup method [" + method.getName() + "] for [" + beanClassElement.getName() + "] " +
+                    "must be static, non-private, accept exactly one java.lang.String or java.lang.CharSequence parameter, " +
+                    "and return a value assignable to the enum type.");
+        }
+        return method;
     }
 
     /**
@@ -548,19 +597,29 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
     }
 
     private ExpressionDef newEnumConstantRef(EnumConstantElement enumConstantElement, Function<String, ExpressionDef> loadClassValueExpressionFn) {
-        return ClassTypeDef.of(
-            AbstractEnumBeanIntrospectionAndReference.EnumConstantDynamicRef.class
-        ).instantiate(
+        ExpressionDef annotationMetadataExpression;
+        if (enumConstantElement.getAnnotationMetadata() == null || enumConstantElement.getAnnotationMetadata().isEmpty()) {
+            annotationMetadataExpression = ClassTypeDef.of(AnnotationMetadata.class).getStaticField("EMPTY_METADATA", TypeDef.of(AnnotationMetadata.class));
+        } else {
+            annotationMetadataExpression = getAnnotationMetadataExpression(enumConstantElement.getAnnotationMetadata(), loadClassValueExpressionFn);
+        }
+        MethodElement valueOfMethod = enumValueOfMethod.orElse(null);
+        if (valueOfMethod != null) {
+            return ClassTypeDef.of(AbstractEnumBeanIntrospectionAndReference.EnumConstantObjectRef.class).instantiate(
+                ENUM_CONSTANT_OBJECT_REF_CONSTRUCTOR,
+                ClassTypeDef.of(enumConstantElement.getOwningType())
+                    .invokeStatic(valueOfMethod, List.of(ExpressionDef.constant(enumConstantElement.getName()))),
+                annotationMetadataExpression
+            );
+        }
+        return ClassTypeDef.of(AbstractEnumBeanIntrospectionAndReference.EnumConstantDynamicRef.class).instantiate(
             ENUM_CONSTANT_DYNAMIC_REF_CONSTRUCTOR,
-
             // 1: push annotation class value
             loadClassValueExpressionFn.apply(enumConstantElement.getOwningType().getName()),
             // 2: push enum name
             ExpressionDef.constant(enumConstantElement.getName()),
             // 3: annotation metadata
-            enumConstantElement.getAnnotationMetadata() == null || enumConstantElement.getAnnotationMetadata().isEmpty() ? (
-                ClassTypeDef.of(AnnotationMetadata.class).getStaticField("EMPTY_METADATA", TypeDef.of(AnnotationMetadata.class))
-            ) : getAnnotationMetadataExpression(enumConstantElement.getAnnotationMetadata(), loadClassValueExpressionFn)
+            annotationMetadataExpression
         );
     }
 
@@ -736,10 +795,14 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
             beanConstructorsField = null;
         }
         if (isEnum) {
-            enumsField = FieldDef.builder(FIELD_ENUM_CONSTANTS_REFERENCES, AbstractEnumBeanIntrospectionAndReference.EnumConstantDynamicRef[].class)
+            Class<?> enumConstantRefType = enumValueOfMethod.isPresent()
+                ? AbstractEnumBeanIntrospectionAndReference.EnumConstantObjectRef.class
+                : AbstractEnumBeanIntrospectionAndReference.EnumConstantDynamicRef.class;
+            ClassTypeDef enumConstantRefTypeDef = ClassTypeDef.of(enumConstantRefType);
+            enumsField = FieldDef.builder(FIELD_ENUM_CONSTANTS_REFERENCES, enumConstantRefTypeDef.array())
                 .addModifiers(Modifier.PRIVATE, Modifier.FINAL, Modifier.STATIC)
                 .initializer(
-                    ClassTypeDef.of(AbstractEnumBeanIntrospectionAndReference.EnumConstantDynamicRef.class).array()
+                    enumConstantRefTypeDef.array()
                         .instantiate(
                             ((EnumElement) beanClassElement).elements().stream()
                                 .map(e -> newEnumConstantRef(e, loadClassValueExpressionFn))
@@ -811,7 +874,10 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
 
                     if (enumsField != null) {
                         values.add(introspectionTypeDef.getStaticField(enumsField));
-                        return aThis.superRef().invokeSuperConstructor(ENUM_INTROSPECTION_SUPER_CONSTRUCTOR, values);
+                        java.lang.reflect.Constructor<?> enumIntrospectionSuperConstructor = enumValueOfMethod.isPresent()
+                            ? ENUM_INTROSPECTION_OBJECT_SUPER_CONSTRUCTOR
+                            : ENUM_INTROSPECTION_SUPER_CONSTRUCTOR;
+                        return aThis.superRef().invokeSuperConstructor(enumIntrospectionSuperConstructor, values);
                     } else if (beanConstructorsField != null) {
                         values.add(introspectionTypeDef.getStaticField(beanConstructorsField));
                         return aThis.superRef().invokeSuperConstructor(INTROSPECTION_SUPER_CONSTRUCTOR_WITH_CONSTRUCTORS, values);
@@ -1196,12 +1262,44 @@ final class BeanIntrospectionWriter implements OriginatingElements, Buildable<Li
     }
 
     private static String computeShortIntrospectionName(String packageName, String className) {
-        final String shortName = NameUtils.getSimpleName(className);
-        return packageName + ".$" + shortName + INTROSPECTION_SUFFIX;
+        return computeIntrospectionName(packageName, NameUtils.getSimpleName(className), className);
     }
 
     private static String computeIntrospectionName(String packageName, String className) {
-        return packageName + ".$" + className.replace('.', '_') + INTROSPECTION_SUFFIX;
+        return computeIntrospectionName(packageName, className.replace('.', '_'), className);
+    }
+
+    /**
+     * Computes the name of the generated introspection, shortening it if it would be too long to
+     * be used as a file name.
+     *
+     * <p>The name is written to the file system twice: as {@code <name>.class} and, more
+     * importantly, as the file name of the
+     * {@code META-INF/micronaut/io.micronaut.core.beans.BeanIntrospectionReference/<name>} service
+     * descriptor, where the whole name including the package is a single path segment. Most file
+     * systems reject a path segment longer than 255 bytes, which an introspection generated on
+     * behalf of another element exceeds as soon as the package is deeply nested, because such a
+     * name repeats the fully qualified class name after the package.</p>
+     *
+     * @param packageName The package the introspection is generated into
+     * @param simpleName  The name of the introspection within that package, without the marker or suffix
+     * @param className   The introspected type, used to keep a shortened name unique
+     * @return The introspection name
+     */
+    private static String computeIntrospectionName(String packageName, String simpleName, String className) {
+        String introspectionName = packageName + ".$" + simpleName + INTROSPECTION_SUFFIX;
+        if (introspectionName.length() <= MAX_INTROSPECTION_NAME_LENGTH) {
+            return introspectionName;
+        }
+        // Keep the tail of the name, which carries the simple name of the introspected type, and
+        // make it unique again with a stable hash of the type the introspection is generated for
+        String hash = "_" + Integer.toHexString(className.hashCode());
+        int available = MAX_INTROSPECTION_NAME_LENGTH - packageName.length() - 2 - hash.length() - INTROSPECTION_SUFFIX.length();
+        if (available < 1) {
+            // the package alone is already too long, nothing but the hash can be kept
+            return packageName + ".$" + hash.substring(1) + INTROSPECTION_SUFFIX;
+        }
+        return packageName + ".$" + simpleName.substring(simpleName.length() - available) + hash + INTROSPECTION_SUFFIX;
     }
 
     /**

@@ -1622,6 +1622,21 @@ public sealed class DefaultBeanContext implements ConfigurableBeanContext permit
     }
 
     @Override
+    public <T> Optional<BeanDefinition<T>> findBeanDefinitionByDefinitionClass(Class<? extends BeanDefinition<T>> definitionClass) {
+        ArgumentUtils.requireNonNull("definitionClass", definitionClass);
+        return Optional.ofNullable(beanDefinitionProvider.findBeanDefinitionByDefinitionClass(this, definitionClass));
+    }
+
+    @Override
+    public <T> Optional<BeanDefinition<T>> findProxyTargetBeanDefinition(BeanDefinition<T> proxyBeanDefinition) {
+        ArgumentUtils.requireNonNull("proxyBeanDefinition", proxyBeanDefinition);
+        if (proxyBeanDefinition instanceof ProxyBeanDefinition<T> proxyDefinition) {
+            return findBeanDefinitionByDefinitionClass(proxyDefinition.getTargetDefinitionType());
+        }
+        return Optional.empty();
+    }
+
+    @Override
     @SuppressWarnings("java:S2789") // performance optimization
     public <T> Optional<BeanDefinition<T>> findProxyTargetBeanDefinition(Argument<T> beanType, @Nullable Qualifier<T> qualifier) {
         ArgumentUtils.requireNonNull("beanType", beanType);
@@ -3431,11 +3446,8 @@ public sealed class DefaultBeanContext implements ConfigurableBeanContext permit
 
         if (beanRegistration != null) {
             if (candidate.isContainerType()) {
-                Object container = beanRegistration.bean;
-                if (container instanceof Object[] array) {
-                    container = Arrays.asList(array);
-                }
-                if (container instanceof Iterable<?> iterable) {
+                Iterable<?> iterable = asIterable(beanRegistration.bean);
+                if (iterable != null) {
                     int i = 0;
                     for (Object o : iterable) {
                         if (o == null || !beanType.isInstance(o)) {
@@ -3455,6 +3467,21 @@ public sealed class DefaultBeanContext implements ConfigurableBeanContext permit
                 beansOfTypeList.add(beanRegistration);
             }
         }
+    }
+
+    @Nullable
+    private Iterable<?> asIterable(@Nullable Object container) {
+        if (container == null) {
+            return null;
+        }
+        if (container instanceof Object[] array) {
+            return Arrays.asList(array);
+        }
+        if (container instanceof Iterable<?> iterable) {
+            return iterable;
+        }
+        // a language integration may model a container that is not a java.lang.Iterable
+        return getConversionService().convert(container, Iterable.class).orElse(null);
     }
 
     private <T> boolean isCandidatePresent(Argument<T> beanType, @Nullable Qualifier<T> qualifier) {
